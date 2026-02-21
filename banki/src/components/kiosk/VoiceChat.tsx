@@ -1,283 +1,301 @@
 'use client';
 
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { Mic, MicOff, Send, Volume2 } from 'lucide-react';
+import {
+  Mic,
+  MicOff,
+  Send,
+  Volume2,
+  VolumeX,
+  Wifi,
+  WifiOff,
+  Loader2,
+  Settings,
+  RefreshCw,
+} from 'lucide-react';
 import { useKioskStore } from '@/stores/kiosk-store';
 import { Transcript } from './Transcript';
-import type { GeminiMessage } from '@/lib/gemini';
+import { GeminiLiveClient } from '@/lib/gemini-live';
+import { VOICE_ASSISTANT_SYSTEM_PROMPT } from '@/lib/prompts';
 
 interface VoiceChatProps {
   onStepChange?: (step: string) => void;
 }
 
+type ConnectionStatus = 'initializing' | 'connecting' | 'connected' | 'error' | 'no-key';
+
 export function VoiceChat({ onStepChange }: VoiceChatProps) {
   const store = useKioskStore();
+  const [status, setStatus] = useState<ConnectionStatus>('initializing');
+  const [statusMsg, setStatusMsg] = useState('');
   const [isTyping, setIsTyping] = useState(false);
-  const [isListeningVoice, setIsListeningVoice] = useState(false);
-  const conversationHistory = useRef<GeminiMessage[]>([]);
-  const recognitionRef = useRef<{ stop: () => void; start: () => void } | null>(null);
-  const synthRef = useRef<SpeechSynthesisUtterance | null>(null);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [isListening, setIsListening] = useState(false);
+  const [pendingEntry, setPendingEntry] = useState<string | undefined>(undefined);
 
-  const getContextInfo = useCallback(() => ({
-    currentStep: store.currentStep,
-    language: store.language,
-    collectedData: {
-      fullName: store.fullName,
-      dateOfBirth: store.dateOfBirth,
-      gender: store.gender,
-      phone: store.phone,
-      email: store.email,
-      address: store.address,
-      occupation: store.occupation,
-      monthlyIncome: store.monthlyIncome,
+  const clientRef = useRef<GeminiLiveClient | null>(null);
+  const recognitionRef = useRef<{ stop: () => void } | null>(null);
+  const greetedRef = useRef(false);
+
+  const getContext = useCallback(
+    () => ({
+      currentStep: store.currentStep,
+      language: store.language,
+      customerName: store.fullName || undefined,
+      collectedData: {
+        fullName: store.fullName || undefined,
+        dateOfBirth: store.dateOfBirth || undefined,
+        gender: store.gender || undefined,
+        phone: store.phone || undefined,
+        email: store.email || undefined,
+        address: store.address || undefined,
+        occupation: store.occupation || undefined,
+        monthlyIncome: store.monthlyIncome || undefined,
+      },
+      idVerified: store.idConfirmed,
+      idNumber: store.idExtractedData?.document_number ?? undefined,
+      livenessPass: store.livenessPass,
+      faceMatchScore: store.faceMatchScore ?? undefined,
+      selectedProductCount: store.selectedProductIds.length,
+    }),
+    [store]
+  );
+
+  const detectStepChange = useCallback(
+    (text: string) => {
+      const lower = text.toLowerCase();
+      const cur = store.currentStep;
+      if (cur === 'greeting' && (lower.includes('full name') || lower.includes('your name') || lower.includes('date of birth'))) {
+        store.setStep('personal_info'); onStepChange?.('personal_info');
+      } else if (cur === 'personal_info' && (lower.includes('identity card') || lower.includes('hold your') || lower.includes('nic') || lower.includes('passport'))) {
+        store.setStep('id_scan'); onStepChange?.('id_scan');
+      } else if (cur === 'id_scan' && (lower.includes('selfie') || lower.includes('look at the camera') || lower.includes('photograph'))) {
+        store.setStep('selfie'); onStepChange?.('selfie');
+      } else if (cur === 'selfie' && (lower.includes('blink') || lower.includes('liveness') || lower.includes('turn your head'))) {
+        store.setStep('liveness'); onStepChange?.('liveness');
+      } else if (cur === 'liveness' && (lower.includes('recommend') || lower.includes('product') || lower.includes('account type'))) {
+        store.setStep('products'); onStepChange?.('products');
+      } else if (cur === 'products' && (lower.includes('review') || lower.includes('summary') || lower.includes('confirm'))) {
+        store.setStep('review'); onStepChange?.('review');
+      } else if (cur === 'review' && (lower.includes('congratulations') || lower.includes('reference number') || lower.includes('submitted'))) {
+        store.setStep('complete'); onStepChange?.('complete');
+      }
     },
-    idVerified: store.idConfirmed,
-    idNumber: store.idExtractedData?.document_number,
-    livenessPass: store.livenessPass,
-    faceMatchScore: store.faceMatchScore,
-    selectedProducts: store.selectedProductIds,
-  }), [store]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [store.currentStep, onStepChange]
+  );
 
-  const speakText = useCallback((text: string, lang: string = 'en') => {
-    if (typeof window === 'undefined' || !window.speechSynthesis) return;
+  const connect = useCallback(async () => {
+    setStatus('connecting');
+    setStatusMsg('Connecting to Gemini Live...');
 
-    window.speechSynthesis.cancel();
-
-    const utterance = new SpeechSynthesisUtterance(text);
-    utterance.lang = lang === 'si' ? 'si-LK' : lang === 'ta' ? 'ta-LK' : 'en-US';
-    utterance.rate = 0.95;
-    utterance.pitch = 1.1;
-
-    utterance.onstart = () => store.setSpeaking(true);
-    utterance.onend = () => store.setSpeaking(false);
-    utterance.onerror = () => store.setSpeaking(false);
-
-    synthRef.current = utterance;
-    window.speechSynthesis.speak(utterance);
-  }, [store]);
-
-  const sendMessage = useCallback(async (message: string) => {
-    if (!message.trim()) return;
-
-    // Add user message to transcript
-    store.addTranscriptEntry({
-      role: 'user',
-      content: message,
-      timestamp: new Date().toISOString(),
-    });
-
-    store.setInputText('');
-    setIsTyping(true);
-
-    // Add to history for Gemini
-    conversationHistory.current.push({ role: 'user', parts: [{ text: message }] });
-
+    let apiKey = '';
     try {
-      const res = await fetch('/api/gemini/chat', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          history: conversationHistory.current.slice(-20), // Keep last 20 turns
-          message,
-          contextInfo: getContextInfo(),
-        }),
-      });
-
-      const data = await res.json();
-      const response = data.response || "I'm sorry, I didn't catch that. Could you repeat?";
-
-      // Add to history
-      conversationHistory.current.push({ role: 'model', parts: [{ text: response }] });
-
-      // Add to transcript
-      store.addTranscriptEntry({
-        role: 'assistant',
-        content: response,
-        timestamp: new Date().toISOString(),
-      });
-
-      // Speak the response
-      speakText(response, store.language);
-
-      // Parse step hints from response
-      parseAndUpdateStep(response);
-
-    } catch (err) {
-      console.error('Chat error:', err);
-      const errorMsg = "I'm having a little trouble connecting. Please try again.";
-      store.addTranscriptEntry({
-        role: 'assistant',
-        content: errorMsg,
-        timestamp: new Date().toISOString(),
-      });
-      speakText(errorMsg);
-    } finally {
-      setIsTyping(false);
-    }
-  }, [store, getContextInfo, speakText]);
-
-  const parseAndUpdateStep = (response: string) => {
-    const lower = response.toLowerCase();
-    const currentStep = store.currentStep;
-
-    if (currentStep === 'greeting' && (
-      lower.includes('full name') || lower.includes('your name') || lower.includes('date of birth')
-    )) {
-      store.setStep('personal_info');
-      onStepChange?.('personal_info');
-    } else if (currentStep === 'personal_info' && (
-      lower.includes('identity card') || lower.includes('nic') || lower.includes('hold your') || lower.includes('camera')
-    )) {
-      store.setStep('id_scan');
-      onStepChange?.('id_scan');
-    } else if (currentStep === 'id_scan' && (
-      lower.includes('selfie') || lower.includes('look at the camera') || lower.includes('photograph')
-    )) {
-      store.setStep('selfie');
-      onStepChange?.('selfie');
-    } else if (currentStep === 'selfie' && (
-      lower.includes('blink') || lower.includes('liveness') || lower.includes('turn your head')
-    )) {
-      store.setStep('liveness');
-      onStepChange?.('liveness');
-    } else if (currentStep === 'liveness' && (
-      lower.includes('recommend') || lower.includes('product') || lower.includes('account type')
-    )) {
-      store.setStep('products');
-      onStepChange?.('products');
-    } else if (currentStep === 'products' && (
-      lower.includes('review') || lower.includes('summary') || lower.includes('confirm')
-    )) {
-      store.setStep('review');
-      onStepChange?.('review');
-    } else if (currentStep === 'review' && (
-      lower.includes('congratulations') || lower.includes('reference number') || lower.includes('submitted')
-    )) {
-      store.setStep('complete');
-      onStepChange?.('complete');
-    }
-  };
-
-  const startVoiceInput = useCallback(() => {
-    if (typeof window === 'undefined') return;
-
-    // Use Function constructor to avoid TypeScript issues with browser speech API
-    type SpeechRecognitionLike = {
-      continuous: boolean;
-      interimResults: boolean;
-      lang: string;
-      onstart: (() => void) | null;
-      onend: (() => void) | null;
-      onerror: (() => void) | null;
-      onresult: ((e: { results: { [key: number]: { [key: number]: { transcript: string } } } }) => void) | null;
-      start: () => void;
-      stop: () => void;
-    };
-    type SpeechRecognitionConstructor = new () => SpeechRecognitionLike;
-
-    const win = window as Window & { SpeechRecognition?: SpeechRecognitionConstructor; webkitSpeechRecognition?: SpeechRecognitionConstructor };
-    const SR = win.SpeechRecognition || win.webkitSpeechRecognition;
-    if (!SR) {
-      alert('Speech recognition is not supported in this browser. Please use Chrome.');
+      const res = await fetch('/api/gemini/config');
+      const cfg = await res.json() as { configured: boolean; apiKey: string };
+      if (!cfg.configured) {
+        setStatus('no-key');
+        setStatusMsg('API key not configured');
+        return;
+      }
+      apiKey = cfg.apiKey;
+    } catch {
+      setStatus('error');
+      setStatusMsg('Could not load configuration');
       return;
     }
+
+    clientRef.current?.disconnect();
+
+    const client = new GeminiLiveClient({
+      apiKey,
+      systemPrompt: VOICE_ASSISTANT_SYSTEM_PROMPT,
+      voiceName: 'Aoede',
+
+      onConnected: () => {
+        setStatus('connected');
+        setStatusMsg('');
+        if (!greetedRef.current) {
+          greetedRef.current = true;
+          setTimeout(() => client.sendText('hello', getContext()), 300);
+        }
+      },
+
+      onText: (text, isFinal) => {
+        setPendingEntry(text);
+        if (isFinal) {
+          store.addTranscriptEntry({ role: 'assistant', content: text, timestamp: new Date().toISOString() });
+          setPendingEntry(undefined);
+          detectStepChange(text);
+        }
+        setIsTyping(!isFinal);
+      },
+
+      onAudioStart: () => { setIsPlaying(true); store.setSpeaking(true); },
+      onAudioDone: () => { setIsPlaying(false); store.setSpeaking(false); },
+      onTurnComplete: () => setIsTyping(false),
+
+      onError: (msg) => {
+        console.error('[GeminiLive]', msg);
+        setStatus('error');
+        setStatusMsg(msg);
+        store.setSpeaking(false);
+        setIsPlaying(false);
+        setIsTyping(false);
+      },
+
+      onDisconnected: () => {
+        setStatus('error');
+        setStatusMsg('Disconnected — click Retry');
+        store.setSpeaking(false);
+      },
+    });
+
+    clientRef.current = client;
+
+    try {
+      await client.connect();
+    } catch (err) {
+      setStatus('error');
+      setStatusMsg(err instanceof Error ? err.message : 'Connection failed');
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    connect();
+    return () => { clientRef.current?.disconnect(); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const sendMessage = useCallback(
+    (text: string) => {
+      const trimmed = text.trim();
+      if (!trimmed || !clientRef.current?.isConnected) return;
+      store.addTranscriptEntry({ role: 'user', content: trimmed, timestamp: new Date().toISOString() });
+      store.setInputText('');
+      setIsTyping(true);
+      clientRef.current.sendText(trimmed, getContext());
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [getContext]
+  );
+
+  const startListening = useCallback(() => {
+    const win = window as Window & { SpeechRecognition?: new () => { continuous: boolean; interimResults: boolean; lang: string; onstart: (() => void) | null; onend: (() => void) | null; onerror: (() => void) | null; onresult: ((e: { results: ArrayLike<{ [k: number]: { transcript: string } }> }) => void) | null; start: () => void; stop: () => void; }; webkitSpeechRecognition?: typeof win.SpeechRecognition };
+    const SR = win.SpeechRecognition ?? win.webkitSpeechRecognition;
+    if (!SR) { alert('Speech recognition not supported. Please use Chrome.'); return; }
 
     const recognition = new SR();
     recognition.continuous = false;
     recognition.interimResults = false;
     recognition.lang = store.language === 'si' ? 'si-LK' : store.language === 'ta' ? 'ta-IN' : 'en-US';
-
-    recognition.onstart = () => setIsListeningVoice(true);
-    recognition.onend = () => setIsListeningVoice(false);
-    recognition.onerror = () => setIsListeningVoice(false);
-
-    recognition.onresult = (event) => {
-      const transcript = event.results[0][0].transcript;
-      sendMessage(transcript);
-    };
-
+    recognition.onstart = () => setIsListening(true);
+    recognition.onend = () => setIsListening(false);
+    recognition.onerror = () => setIsListening(false);
+    recognition.onresult = (e) => { sendMessage(e.results[0][0].transcript); };
     recognitionRef.current = recognition;
     recognition.start();
   }, [store.language, sendMessage]);
 
-  const stopVoiceInput = useCallback(() => {
-    recognitionRef.current?.stop();
-    setIsListeningVoice(false);
-  }, []);
+  const stopListening = useCallback(() => { recognitionRef.current?.stop(); setIsListening(false); }, []);
 
-  // Initial greeting
-  useEffect(() => {
-    const greet = async () => {
-      await new Promise((r) => setTimeout(r, 500));
-      await sendMessage('hello');
-    };
-    if (store.transcript.length === 0) {
-      greet();
-    }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  const isReady = status === 'connected';
 
   return (
     <div className="flex flex-col h-full">
-      {/* Transcript area */}
-      <div className="flex-1 overflow-hidden p-4">
-        <Transcript entries={store.transcript} isTyping={isTyping} />
-      </div>
-
-      {/* Speaking indicator */}
-      {store.isSpeaking && (
-        <div className="flex items-center gap-2 px-4 py-2 text-cyan-600 text-sm">
-          <Volume2 className="h-4 w-4 animate-pulse" />
-          <span className="text-xs">Banki is speaking...</span>
+      {/* Status banner */}
+      {status === 'no-key' && (
+        <div className="px-4 py-2.5 bg-amber-50 border-b border-amber-100 flex items-center gap-2 text-sm text-amber-700">
+          <WifiOff className="h-4 w-4 flex-shrink-0" />
+          <span>
+            Gemini API key not configured.{' '}
+            <a href="/admin/settings" className="underline font-medium">Add it in Admin → Settings</a>
+            {' '}then reload.
+          </span>
+        </div>
+      )}
+      {status === 'error' && (
+        <div className="px-4 py-2.5 bg-red-50 border-b border-red-100 flex items-center gap-2 text-sm text-red-700">
+          <WifiOff className="h-4 w-4 flex-shrink-0" />
+          <span className="flex-1 truncate">{statusMsg}</span>
+          <button onClick={connect} className="flex items-center gap-1 px-2 py-1 bg-red-100 hover:bg-red-200 rounded-lg text-xs font-medium transition-colors">
+            <RefreshCw className="h-3 w-3" /> Retry
+          </button>
+        </div>
+      )}
+      {(status === 'connecting' || status === 'initializing') && (
+        <div className="px-4 py-2 bg-cyan-50 border-b border-cyan-100 flex items-center gap-2 text-xs text-cyan-600">
+          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+          Connecting to Gemini Live...
         </div>
       )}
 
-      {/* Input area */}
-      <div className="p-4 border-t border-gray-100 bg-white">
-        <div className="flex gap-3 items-end">
-          <div className="flex-1 relative">
-            <textarea
-              value={store.inputText}
-              onChange={(e) => store.setInputText(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter' && !e.shiftKey) {
-                  e.preventDefault();
-                  sendMessage(store.inputText);
-                }
-              }}
-              placeholder="Type your response or use the microphone..."
-              className="w-full resize-none px-4 py-3 pr-12 rounded-2xl border border-gray-200 focus:border-cyan-400 focus:outline-none focus:ring-2 focus:ring-cyan-100 text-sm min-h-[52px] max-h-32"
-              rows={1}
-            />
+      {/* Transcript */}
+      <div className="flex-1 overflow-hidden p-4">
+        <Transcript entries={store.transcript} isTyping={isTyping} pendingAssistantText={pendingEntry} />
+      </div>
+
+      {/* Audio indicator */}
+      {isPlaying && (
+        <div className="flex items-center gap-2 px-4 py-1.5 text-cyan-600 text-xs border-t border-gray-50">
+          <Volume2 className="h-3.5 w-3.5 animate-pulse" />
+          <span>Banki is speaking</span>
+          <div className="flex gap-0.5 ml-1">
+            {[0, 1, 2, 3].map((i) => (
+              <span key={i} className="w-0.5 bg-cyan-400 rounded-full animate-bounce" style={{ height: 12, animationDelay: `${i * 100}ms` }} />
+            ))}
           </div>
-
-          {/* Voice button */}
-          <button
-            onClick={isListeningVoice ? stopVoiceInput : startVoiceInput}
-            disabled={isTyping}
-            className={`p-3.5 rounded-2xl transition-all flex-shrink-0 ${
-              isListeningVoice
-                ? 'bg-red-500 text-white animate-pulse'
-                : 'bg-gray-100 text-gray-600 hover:bg-cyan-100 hover:text-cyan-600'
-            }`}
-          >
-            {isListeningVoice ? <MicOff className="h-5 w-5" /> : <Mic className="h-5 w-5" />}
+          <button onClick={() => clientRef.current?.stopAudio()} className="ml-auto text-gray-400 hover:text-gray-600" title="Stop">
+            <VolumeX className="h-3.5 w-3.5" />
           </button>
+        </div>
+      )}
 
-          {/* Send button */}
+      {/* Input */}
+      <div className="p-4 border-t border-gray-100 bg-white">
+        <div className="flex items-center gap-2 mb-2 text-xs">
+          {isReady ? (
+            <span className="flex items-center gap-1 text-green-600">
+              <Wifi className="h-3 w-3" /> Gemini Live · Aoede voice
+            </span>
+          ) : status === 'no-key' ? (
+            <a href="/admin/settings" className="flex items-center gap-1 text-amber-600 hover:underline">
+              <Settings className="h-3 w-3" /> Configure API key
+            </a>
+          ) : null}
+        </div>
+
+        <div className="flex gap-2 items-end">
+          <textarea
+            value={store.inputText}
+            onChange={(e) => store.setInputText(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(store.inputText); } }}
+            placeholder={isReady ? 'Type or use the mic...' : 'Connecting...'}
+            disabled={!isReady}
+            className="flex-1 resize-none px-4 py-3 rounded-2xl border border-gray-200 focus:border-cyan-400 focus:outline-none focus:ring-2 focus:ring-cyan-100 text-sm min-h-[52px] max-h-32 disabled:bg-gray-50 disabled:text-gray-400"
+            rows={1}
+          />
+          <button
+            onClick={isListening ? stopListening : startListening}
+            disabled={!isReady}
+            className={`p-3.5 rounded-2xl transition-all flex-shrink-0 ${isListening ? 'bg-red-500 text-white animate-pulse' : 'bg-gray-100 text-gray-600 hover:bg-cyan-100 hover:text-cyan-600 disabled:opacity-40'}`}
+          >
+            {isListening ? <MicOff className="h-5 w-5" /> : <Mic className="h-5 w-5" />}
+          </button>
           <button
             onClick={() => sendMessage(store.inputText)}
-            disabled={!store.inputText.trim() || isTyping}
+            disabled={!store.inputText.trim() || !isReady}
             className="p-3.5 bg-cyan-500 text-white rounded-2xl hover:bg-cyan-600 transition-colors flex-shrink-0 disabled:opacity-40 disabled:cursor-not-allowed"
           >
             <Send className="h-5 w-5" />
           </button>
         </div>
 
-        {isListeningVoice && (
+        {isListening && (
           <div className="mt-2 flex items-center gap-2 text-red-500 text-xs">
             <span className="w-2 h-2 bg-red-500 rounded-full animate-ping" />
-            Listening... Click the mic to stop
+            Listening — speak now
           </div>
         )}
       </div>
