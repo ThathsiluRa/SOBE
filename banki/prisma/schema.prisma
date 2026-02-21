@@ -1,0 +1,83 @@
+// This is your Prisma schema file
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Application {
+  id                  String   @id @default(uuid())
+  customerId          String   @unique
+  status              String   @default("in_progress")
+
+  fullName            String?
+  dateOfBirth         String?
+  gender              String?
+  phone               String?
+  email               String?
+  address             String?
+  occupation          String?
+  monthlyIncome       String?
+  language            String   @default("en")
+
+  idDocumentType      String?
+  idNumber            String?
+  idImagePath         String?
+  idExtractedData     String?
+  idConfidence        Float?
+
+  selfiePath          String?
+  faceMatchScore      Float?
+  livenessPass        Boolean  @default(false)
+
+  selectedProducts    String?
+  recommendedProducts String?
+
+  transcript          String?
+
+  pdfPath             String?
+
+  reviewNotes         String?
+  rejectionReason     String?
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+}
+
+model Product {
+  id               String   @id @default(uuid())
+  name             String
+  type             String
+  description      String
+  features         String
+  interestRate     Float?
+  eligibilityRules String
+  termsConditions  String?
+  isActive         Boolean  @default(true)
+  displayOrder     Int      @default(0)
+  createdAt        DateTime @default(now())
+}
+
+model Flow {
+  id          String   @id @default(uuid())
+  name        String
+  description String?
+  nodes       String
+  edges       String
+  isPublished Boolean  @default(false)
+  isTemplate  Boolean  @default(false)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model Settings {
+  id                 String  @id @default("default")
+  bankName           String  @default("Demo Bank")
+  geminiApiKey       String  @default("")
+  faceMatchThreshold Float   @default(0.85)
+  primaryColor       String  @default("06B6D4")
+  logoPath           String?
+}

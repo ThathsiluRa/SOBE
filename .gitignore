@@ -1,0 +1,5 @@
+banki/node_modules/
+banki/.next/
+banki/prisma/dev.db
+banki/prisma/dev.db-journal
+banki/.env.local
