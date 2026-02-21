@@ -172,6 +172,10 @@ export function VoiceChat({ onStepChange }: VoiceChatProps) {
     (text: string) => {
       const trimmed = text.trim();
       if (!trimmed || !clientRef.current?.isConnected) return;
+      // Interrupt any ongoing audio playback before sending
+      clientRef.current.stopAudio();
+      setIsPlaying(false);
+      store.setSpeaking(false);
       store.addTranscriptEntry({ role: 'user', content: trimmed, timestamp: new Date().toISOString() });
       store.setInputText('');
       setIsTyping(true);

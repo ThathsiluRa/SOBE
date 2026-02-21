@@ -4,7 +4,15 @@
  * Audio output is PCM16 at 24kHz played via Web Audio API (actual Gemini voice).
  */
 
-export type GeminiVoiceName = 'Puck' | 'Charon' | 'Kore' | 'Fenrir' | 'Aoede';
+export type GeminiVoiceName =
+  | 'Puck'
+  | 'Charon'
+  | 'Kore'
+  | 'Fenrir'
+  | 'Aoede'
+  | 'Orbit'
+  | 'Zephyr'
+  | 'Leda';
 
 export interface GeminiLiveConfig {
   apiKey: string;
@@ -19,7 +27,7 @@ export interface GeminiLiveConfig {
   onDisconnected?: () => void;
 }
 
-const GEMINI_LIVE_MODEL = 'models/gemini-2.0-flash-exp';
+const GEMINI_LIVE_MODEL = 'models/gemini-2.5-flash-native-audio-preview-12-2025';
 const SAMPLE_RATE = 24000;
 
 export class GeminiLiveClient {
@@ -64,7 +72,7 @@ export class GeminiLiveClient {
             setup: {
               model: GEMINI_LIVE_MODEL,
               generationConfig: {
-                responseModalities: ['AUDIO', 'TEXT'],
+                responseModalities: ['AUDIO'],
                 speechConfig: {
                   voiceConfig: {
                     prebuiltVoiceConfig: {
@@ -72,6 +80,8 @@ export class GeminiLiveClient {
                     },
                   },
                 },
+                // Request text transcript alongside native audio
+                outputAudioTranscription: {},
               },
               systemInstruction: {
                 parts: [
@@ -179,6 +189,8 @@ export class GeminiLiveClient {
         inlineData?: { mimeType: string; data: string };
       }>;
     };
+    /** Native audio models return transcript here instead of parts[].text */
+    outputTranscription?: { text?: string };
     turnComplete?: boolean;
   }) {
     for (const part of content.modelTurn?.parts ?? []) {
@@ -190,6 +202,12 @@ export class GeminiLiveClient {
         this.pendingText += part.text;
         this.config.onText?.(this.pendingText, false);
       }
+    }
+
+    // Native audio model delivers transcript via outputTranscription
+    if (content.outputTranscription?.text) {
+      this.pendingText = content.outputTranscription.text;
+      this.config.onText?.(this.pendingText, false);
     }
 
     if (content.turnComplete) {
